@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visor 3D con Corte Visual y Caída Simulada</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Inter', sans-serif; background-color: #f0f0f0; }
+        #container { width: 100vw; height: 100vh; display: block; cursor: grab; }
+        #container.clipping-active { cursor: crosshair; }
+        #container:active { cursor: grabbing; }
+        #container.clipping-active:active { cursor: crosshair; }
+        #controls { position: absolute; top: 1rem; left: 1rem; background-color: rgba(255, 255, 255, 0.8); padding: 0.75rem; border-radius: 0.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: flex; flex-direction: column; gap: 0.5rem; max-width: 250px; }
+        button { padding: 0.5rem 1rem; border: none; border-radius: 0.375rem; background-color: #3b82f6; color: white; font-weight: 500; cursor: pointer; transition: background-color 0.2s; }
+        button:hover { background-color: #2563eb; }
+        .info-text { font-size: 0.8rem; color: #555; }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+    <div id="controls">
+        <h3 class="text-lg font-semibold mb-2">Controles</h3>
+        <button id="clipButton">Activar Corte Visual</button>
+        <p id="clipInfo" class="info-text" style="display: none;">Arrastra sobre el modelo para definir el plano. Suelta para ver caer la pieza.</p>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+        import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
+
+        let scene, camera, renderer, controls, model, modelCenter = new THREE.Vector3();
+        let cutPiece; // El clon del modelo para simular la pieza cortada
+        let clipPlaneMain, clipPlaneCutPiece; // Planos opuestos para el clipping visual
+        let clippingEnabled = false; // ¿Modo corte activo?
+        let isDraggingClip = false; // ¿Arrastrando para definir plano?
+
+        // --- Variables para Corte Visual ---
+        const raycaster = new THREE.Raycaster();
+        const mouseVector = new THREE.Vector2();
+        const planeNormal = new THREE.Vector3(); // Normal del plano (dirección de la cámara)
+        const intersectionPoint = new THREE.Vector3(); // Punto donde el rayo corta el modelo
+        const separationDistance = 0.5; // Distancia INICIAL para separar visualmente durante el drag (pequeña)
+
+        // --- Variables para Simulación de Caída ---
+        let isPieceFalling = false; // ¿Está la pieza cortada cayendo?
+        const gravity = new THREE.Vector3(0, -20.0, 0); // Gravedad (ajustar fuerza)
+        const cutPieceVelocity = new THREE.Vector3(0, 0, 0); // Velocidad inicial de caída
+        const fallDamping = 0.98; // Factor de amortiguación (simula resistencia del aire)
+        const clock = new THREE.Clock(); // Para calcular el tiempo delta en la animación
+
+        const container = document.getElementById('container');
+        const clipButton = document.getElementById('clipButton');
+        const clipInfo = document.getElementById('clipInfo');
+
+        // --- Configuración Inicial ---
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 20, 70); // Ajustar posición inicial
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.localClippingEnabled = true; // ¡IMPORTANTE para el clipping visual!
+            container.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.screenSpacePanning = false;
+            controls.minDistance = 5;
+            controls.maxDistance = 300;
+
+            // Luces
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+            scene.add(ambientLight);
+            const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight1.position.set(50, 50, 50);
+            scene.add(dirLight1);
+            const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight2.position.set(-50, 50, -50);
+            scene.add(dirLight2);
+
+            // Planos de corte (visuales)
+            clipPlaneMain = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // Inicial (arbitrario)
+            clipPlaneCutPiece = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0); // Inicial opuesto
+
+            loadModel();
+
+            window.addEventListener('resize', onWindowResize);
+            clipButton.addEventListener('click', toggleClipping);
+            container.addEventListener('mousedown', onMouseDown);
+            container.addEventListener('mousemove', onMouseMove);
+            container.addEventListener('mouseup', onMouseUp);
+            container.addEventListener('mouseleave', onMouseUp);
+
+            animate();
+        }
+
+        // --- Carga del Modelo ---
+        function loadModel() {
+            const mtlLoader = new MTLLoader();
+            const mtlPath = './';
+            const objFileName = 'Rib_Slab_0407173318_texture.obj';
+            const mtlFileName = 'Rib_Slab_0407173318_texture.mtl';
+
+            mtlLoader.setPath(mtlPath);
+            mtlLoader.load(mtlFileName, (materials) => {
+                materials.preload();
+
+                // Configurar materiales base (para ambos modelos)
+                const baseMaterialConfig = (material) => {
+                    material.side = THREE.DoubleSide;
+                    material.clipIntersection = false; // No mostrar línea de corte
+                    material.clippingPlanes = null; // Inicialmente sin planos
+                    material.needsUpdate = true;
+                };
+                Object.values(materials.materials).forEach(baseMaterialConfig);
+
+                const objLoader = new OBJLoader();
+                objLoader.setMaterials(materials);
+                objLoader.setPath(mtlPath);
+                objLoader.load(objFileName, (object) => {
+                    model = object;
+
+                    // Centrar y escalar el modelo original
+                    const box = new THREE.Box3().setFromObject(model);
+                    box.getCenter(modelCenter);
+                    const size = box.getSize(new THREE.Vector3());
+                    const maxDim = Math.max(size.x, size.y, size.z);
+                    const scale = 50 / maxDim;
+                    model.scale.set(scale, scale, scale);
+                    model.position.sub(modelCenter.multiplyScalar(scale));
+                    model.updateMatrixWorld(true); // Actualizar matriz
+
+                    // --- Crear el Clon (Pieza Cortada/Caída) ---
+                    cutPiece = model.clone(true); // Clonar recursivamente
+                    cutPiece.visible = false; // Inicialmente oculto
+                    resetCutPieceState(); // Asegurar posición y velocidad inicial
+
+                    scene.add(model);
+                    scene.add(cutPiece);
+
+                    console.log('Modelo cargado, centrado y clonado.');
+                    controls.target.copy(model.position); // Centrar cámara
+                    controls.update();
+
+                }, undefined, (error) => {
+                    console.error('Error cargando el archivo OBJ:', error);
+                    alert(`Error cargando ${objFileName}. Verifica consola.`);
+                });
+
+            }, undefined, (error) => {
+                console.error('Error cargando el archivo MTL:', error);
+                alert(`Error cargando ${mtlFileName}. Verifica consola.`);
+            });
+        }
+
+        // --- Función auxiliar para aplicar planos de corte a materiales ---
+        function applyClippingPlanes(object, planes) {
+            if (!object) return;
+            object.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    // Asegurarse de que sea un array para poder iterar
+                    const materials = Array.isArray(child.material) ? child.material : [child.material];
+                    materials.forEach(mat => {
+                        // Solo modificar planos si son diferentes
+                        if (mat.clippingPlanes !== planes) {
+                           mat.clippingPlanes = planes;
+                           mat.needsUpdate = true;
+                        }
+                    });
+                }
+            });
+        }
+
+        // --- Resetear Estado de la Pieza Cortada ---
+        function resetCutPieceState() {
+            if (cutPiece) {
+                cutPiece.position.copy(model.position); // Alinear con el original
+                cutPiece.rotation.copy(model.rotation); // Asegurar misma rotación
+                cutPieceVelocity.set(0, 0, 0); // Resetear velocidad
+                isPieceFalling = false; // Detener simulación de caída
+            }
+        }
+
+        // --- Control del Corte (Botón) ---
+        function toggleClipping() {
+            clippingEnabled = !clippingEnabled;
+            clipButton.textContent = clippingEnabled ? 'Desactivar Corte' : 'Activar Corte Visual';
+            clipInfo.style.display = clippingEnabled ? 'block' : 'none';
+            container.classList.toggle('clipping-active', clippingEnabled);
+
+            if (cutPiece) {
+                if (clippingEnabled) {
+                    // Al activar: preparar, pero no mostrar/cortar hasta el drag
+                    resetCutPieceState(); // Asegurar que la pieza clonada está alineada y quieta
+                    cutPiece.visible = false; // Mantener oculta inicialmente
+                    applyClippingPlanes(model, null); // Quitar planos por si acaso
+                    applyClippingPlanes(cutPiece, null);
+                } else {
+                    // Al desactivar: ocultar clon, quitar planos, resetear estado
+                    cutPiece.visible = false;
+                    applyClippingPlanes(model, null);
+                    applyClippingPlanes(cutPiece, null);
+                    resetCutPieceState();
+                    isDraggingClip = false; // Asegurar que no se queda en estado drag
+                    controls.enabled = true; // Asegurar controles activos
+                }
+            }
+            render();
+        }
+
+        // --- Control del Corte (Ratón) ---
+        function onMouseDown(event) {
+            if (clippingEnabled && event.button === 0 && model) {
+                isDraggingClip = true;
+                controls.enabled = false; // Desactivar cámara
+                resetCutPieceState(); // Resetear pieza antes de empezar nuevo corte
+                cutPiece.visible = true; // Mostrar clon AHORA
+                updateClippingInteraction(event.clientX, event.clientY); // Calcular plano inicial y aplicar
+            }
+        }
+
+        function onMouseMove(event) {
+            if (isDraggingClip) {
+                updateClippingInteraction(event.clientX, event.clientY); // Actualizar plano y separación visual
+            }
+        }
+
+        function onMouseUp(event) {
+            if (isDraggingClip && event.button === 0) {
+                isDraggingClip = false;
+                controls.enabled = true; // Reactivar cámara
+
+                // ¡Iniciar la caída!
+                if (cutPiece) {
+                    isPieceFalling = true;
+                    // Podrías darle una pequeña velocidad inicial si quisieras:
+                    // cutPieceVelocity.set(Math.random() * 2 - 1, -1, Math.random() * 2 - 1);
+                }
+            }
+             // Seguridad por si se suelta fuera de drag
+             else if (!isDraggingClip && !controls.enabled && event.button === 0){
+                 controls.enabled = true;
+             }
+        }
+
+        // --- Lógica Principal de Actualización del Corte Visual (Durante Drag) ---
+        function updateClippingInteraction(mouseX, mouseY) {
+            if (!model || !cutPiece) return;
+
+            // 1. Calcular coords ratón y lanzar rayo
+            const rect = container.getBoundingClientRect();
+            mouseVector.x = ((mouseX - rect.left) / rect.width) * 2 - 1;
+            mouseVector.y = -((mouseY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(mouseVector, camera);
+
+            // 2. Intersecar con el modelo original
+            const intersects = raycaster.intersectObject(model, true);
+
+            if (intersects.length > 0) {
+                // 3. Obtener punto y normal (dirección de cámara)
+                intersectionPoint.copy(intersects[0].point);
+                camera.getWorldDirection(planeNormal);
+
+                // 4. Calcular constante y actualizar planos opuestos
+                const constant = -intersectionPoint.dot(planeNormal);
+                clipPlaneMain.normal.copy(planeNormal);
+                clipPlaneMain.constant = constant;
+                clipPlaneCutPiece.normal.copy(planeNormal).negate();
+                clipPlaneCutPiece.constant = -constant;
+
+                // 5. Aplicar planos a los modelos
+                applyClippingPlanes(model, [clipPlaneMain]);
+                applyClippingPlanes(cutPiece, [clipPlaneCutPiece]);
+
+                // 6. Separar visualmente la pieza clonada DURANTE el drag
+                //    (Solo si no está cayendo)
+                if (!isPieceFalling) {
+                    const separationVector = planeNormal.clone().multiplyScalar(separationDistance);
+                    cutPiece.position.copy(model.position).add(separationVector);
+                }
+
+            } else {
+                // Si no hay intersección, no actualizar planos
+                 // console.log("Ratón fuera del modelo.");
+            }
+            render(); // Forzar renderizado
+        }
+
+
+        // --- Redimensionar Ventana ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            render();
+        }
+
+        // --- Bucle de Animación ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const deltaTime = clock.getDelta(); // Tiempo desde el último frame
+
+            // Actualizar controles de órbita si están activos
+            if (controls.enabled) {
+                controls.update();
+            }
+
+            // --- Simulación de Caída ---
+            if (isPieceFalling && cutPiece) {
+                // Aplicar gravedad a la velocidad
+                cutPieceVelocity.add(gravity.clone().multiplyScalar(deltaTime));
+                // Aplicar amortiguación
+                cutPieceVelocity.multiplyScalar(fallDamping);
+                // Actualizar posición basada en velocidad
+                cutPiece.position.add(cutPieceVelocity.clone().multiplyScalar(deltaTime));
+
+                // Opcional: Detener si cae muy bajo
+                // if (cutPiece.position.y < -200) {
+                //    isPieceFalling = false;
+                //    cutPieceVelocity.set(0,0,0);
+                // }
+            }
+
+            render(); // Renderizar la escena
+        }
+
+        // --- Función de Renderizado ---
+        function render() {
+             renderer.render(scene, camera);
+        }
+
+        // --- Iniciar ---
+        init();
+
+    </script>
+</body>
+</html>
